@@ -27,14 +27,14 @@
 
 ## 🏗 Архитектура системы (System Architecture)
 
-Система построена на базе асинхронного ядра **Python (AsyncIO + aiohttp)**. Все I/O операции строго неблокирующие. Разделение бизнес-логики реализовано через изолированные процессы (API, Admin, Background Workers), общающиеся через **Redis Pub/Sub**.
+Система построена на базе асинхронного ядра **Python (AsyncIO + aiohttp)**. Все I/O операции строго неблокирующие. Для максимальной безопасности бизнес-логика разделена на независимые процессы (Main API, Admin API, Background Workers), общающиеся через **Redis Pub/Sub**.
 
 ```mermaid
 flowchart TD
     Client["Web / PWA / Native APK"] -->|"HTTPS / WSS"| Nginx["Nginx Reverse Proxy"]
     
-    Nginx -->|"API Requests / WS"| MainApp["Main App API (aiohttp)"]
-    Nginx -->|"Port 8081"| AdminApp["Admin Server (aiohttp)"]
+    Nginx -->|"Port 8080 (API/WS)"| MainApp["Main App API (aiohttp)"]
+    Nginx -->|"Port 8081 (Admin)"| AdminApp["Admin Server (aiohttp)"]
     
     subgraph Storage ["Data Layer"]
         DB[("PostgreSQL")]
@@ -44,7 +44,8 @@ flowchart TD
     MainApp -->|"AsyncPG / SQLModel"| DB
     MainApp -->|"Cache & Pub/Sub"| Redis
     
-    AdminApp -.-> DB
+    AdminApp -.->|"Monitoring & Moderation"| DB
+    AdminApp -.->|"Admin WS / FCM"| Redis
     
     MainApp -->|"S3 Async Uploads"| S3["Yandex Cloud S3"]
     
@@ -55,11 +56,12 @@ flowchart TD
     subgraph Background_Workers ["Background Task Loop"]
         Worker1["AI Night Worker"]
         Worker2["iCal Sync Loop"]
-        Worker3["Garbage Collector (S3/Auth)"]
-        Worker4["Auto-Translation"]
+        Worker3["Broadcast / Mod Queue"]
+        Worker4["Garbage Collector (S3/Auth)"]
     end
     
     MainApp --> Background_Workers
+    AdminApp --> Background_Workers
 ```
 
 ---
@@ -75,6 +77,7 @@ erDiagram
     USERS ||--o{ TRANSACTIONS : completes
     RENT_OBJECTS ||--o{ BOOKINGS : has
     BOOKINGS ||--o{ REVIEWS : receives
+    USERS ||--o{ MODERATION_QUEUE : submits
     
     USERS {
         int user_id PK
@@ -134,15 +137,16 @@ erDiagram
 - Мульти-провайдерная логика LLM (переключение между IO.net и OpenRouter). В случае получения HTTP 429 от провайдера, ключ мгновенно уходит в `Redis Cooldown`, и запрос бесшовно передается на следующий ключ/модель.
 - **AST Recovery:** Поскольку нейросети периодически возвращают "грязный" JSON (с Markdown-тегами или одинарными кавычками), реализован интеллектуальный парсер с фоллбэком на `ast.literal_eval` Python для гарантированного восстановления бизнес-данных.
 
-### 3. Картографический движок (MapLibre GL JS)
+### 3. Изолированная панель Администратора (Zero Trust)
+- Выделенный aiohttp-процесс, работающий на отдельном порту (8081), недоступный для обычных пользователей.
+- **2FA & TOTP:** Доступ к админке защищен Time-based One-Time Passwords и JWT-токенами.
+- **Гибридная ИИ-Модерация:** Заявки на изменение профилей и объектов автоматически обрабатываются Background-воркером через LLM. Модератор вмешивается только при спорных (partial) решениях нейросети.
+- Сквозная кросс-процессная генерация Excel-отчетов о финансах и KPI платформы с помощью `openpyxl`.
+
+### 4. Картографический движок (MapLibre GL JS)
 - Использование MapLibre 5.x с поддержкой аппаратного ускорения (WebGL) и 3D Глобуса. 
 - Динамическая кластеризация маркеров на клиенте и расчет дистанции (Haversine formula).
 - Интеграция процедурных эффектов (Огни городов ночью, Звездное небо, Атмосфера), зависящих от `pitch` и `zoom` камеры.
-
-### 4. Zero Trust & Anti-Spam Security
-- Проверка авторизации на уровне кастомных aiohttp Middlewares. На клиенте состояние визуально оптимистично, но сервер валидирует все изменения данных.
-- Подтверждения по Email через временные коды (OTP), хранящиеся в БД с жестким лимитом попыток (`brute-force protection`).
-- Все I/O (Загрузка в S3 бакет) использует валидацию `Magic Bytes`, отсекая исполняемые файлы до этапа обработки.
 
 ### 5. Unified Notification Protocol & DND
 - Единый интерфейс пуш-уведомлений через **Firebase Cloud Messaging**.
@@ -158,6 +162,7 @@ erDiagram
 * `PostgreSQL` + `asyncpg` + `SQLModel`
 * `Redis` (Pub/Sub & Rate Limiting ZSET)
 * `OpenRouter API` / `IO.net API` (AI LLMs: LLaMA 3, Qwen, DeepSeek)
+* `pyotp` & `PyJWT` (Admin Security)
 
 **Frontend / Mobile:**
 * `Vanilla JavaScript` (ES6+), `HTML5`, `CSS3`
